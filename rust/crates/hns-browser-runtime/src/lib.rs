@@ -34,7 +34,7 @@ use hns_p2p::{
 };
 use hns_resolver::{
     AuthoritativeDnssecResolver, AuthoritativeDohEndpoint, AuthoritativeDohTlsAuthentication,
-    CompositeResolver, DelegatedResolver, DelegatingResolver, DnsEndpointPolicy,
+    CachedResolver, CompositeResolver, DelegatedResolver, DelegatingResolver, DnsEndpointPolicy,
     DnsInterceptionStatus, DnsTransport, HnsDelegation, HnsProofProvider, HnsResourceValueProvider,
     NameClass, ProvenNameRecords, ResolutionAnswer, ResolutionRequest, Resolver, ResolverError,
     ResourceValueAnchor, SqliteResourceValueProvider, SystemDnssecVerifier, UdpTcpDnsTransport,
@@ -67,6 +67,8 @@ pub const DEFAULT_RESOURCE_CACHE_LIMIT_BYTES: usize = 50 * 1024 * 1024;
 pub const MAX_GATEWAY_HEADER_TEXT_BYTES: usize = 64 * 1024;
 pub const MAX_BROWSER_PROXY_RESOLUTION_TRACE_JSON_BYTES: usize = 64 * 1024;
 const MAX_STATIC_RELAY_PEER_ENDPOINT_BYTES: usize = 320;
+const GATEWAY_RESOLVER_CACHE_ENTRIES: usize = 1_024;
+const GATEWAY_RESOLVER_CACHE_TTL: Duration = Duration::from_secs(300);
 
 /// Shared browser-facing classification; native shells must not duplicate
 /// the resolver's generated ICANN and special-use namespace policy.
@@ -1077,6 +1079,7 @@ struct RuntimeInner {
     proxy_session: OnceLock<ProxySessionId>,
     proxy_generation: AtomicU64,
     operation: Mutex<()>,
+    gateway_resolvers: Mutex<HashMap<GatewayResolverKey, Arc<PersistentGatewayResolver>>>,
 }
 
 struct RuntimeCoordination {
@@ -1175,6 +1178,7 @@ impl BrowserRuntime {
                 proxy_session: OnceLock::new(),
                 proxy_generation: AtomicU64::new(0),
                 operation: Mutex::new(()),
+                gateway_resolvers: Mutex::new(HashMap::new()),
             }),
         })
     }
@@ -1491,6 +1495,11 @@ impl BrowserRuntime {
             .maintenance
             .write()
             .map_err(|_| RuntimeError::Synchronization("maintenance lock"))?;
+        self.inner
+            .gateway_resolvers
+            .lock()
+            .map_err(|_| RuntimeError::Synchronization("gateway resolver cache"))?
+            .clear();
         clear_resolver_cache_inner(&self.inner.data_dir, self.inner.configuration.network)
             .map_err(RuntimeError::Operation)
     }
@@ -1850,7 +1859,76 @@ struct PreparedRuntimeGateway {
     dns_trace: DnsTraceRecorder,
 }
 
+impl Drop for PreparedRuntimeGateway {
+    fn drop(&mut self) {
+        self.fallback_marker.reset();
+        self.dns_trace.reset();
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct GatewayResolverKey {
+    base: PathBuf,
+    chain_tip: Option<(u32, String)>,
+    mode: &'static str,
+    doh_endpoint: String,
+    experimental_p2p_dns_relay: bool,
+    legacy_hns_doh_compatibility: bool,
+}
+
+struct PersistentGatewayResolver {
+    resolver: AndroidGatewayResolver,
+    fallback_marker: FallbackMarker,
+    dns_trace: DnsTraceRecorder,
+}
+
 impl BrowserRuntime {
+    fn persistent_gateway_resolver(
+        &self,
+        base: PathBuf,
+        context: GatewayResolverContext,
+    ) -> Result<Arc<PersistentGatewayResolver>, RuntimeError> {
+        let chain_tip = best_synced_header(&base, context.network)
+            .ok()
+            .map(|best| (best.height.0, best.header.tree_root.to_string()));
+        let key = GatewayResolverKey {
+            base: base.clone(),
+            chain_tip: chain_tip.clone(),
+            mode: context.mode.as_str(),
+            doh_endpoint: context.doh_endpoint.display(),
+            experimental_p2p_dns_relay: context.experimental_p2p_dns_relay,
+            legacy_hns_doh_compatibility: context.legacy_hns_doh_compatibility,
+        };
+        let mut resolvers = self
+            .inner
+            .gateway_resolvers
+            .lock()
+            .map_err(|_| RuntimeError::Synchronization("gateway resolver cache"))?;
+        resolvers.retain(|existing, _| existing.base != base || existing.chain_tip == chain_tip);
+        if let Some(resolver) = resolvers.get(&key) {
+            return Ok(Arc::clone(resolver));
+        }
+
+        let values = SqliteResourceValueProvider::open(base.join("resources.sqlite"))
+            .map_err(|error| RuntimeError::Operation(format!("open resource cache: {error}")))?;
+        let fallback_marker = FallbackMarker::default();
+        let dns_trace = DnsTraceRecorder::default();
+        let resolver = android_gateway_resolver(
+            base,
+            values,
+            context,
+            fallback_marker.clone(),
+            dns_trace.clone(),
+        );
+        let persistent = Arc::new(PersistentGatewayResolver {
+            resolver,
+            fallback_marker,
+            dns_trace,
+        });
+        resolvers.insert(key, Arc::clone(&persistent));
+        Ok(persistent)
+    }
+
     fn acquire_proxy_maintenance<'a>(
         &'a self,
         cancellation: &ProxyCancellationToken,
@@ -1896,13 +1974,8 @@ impl BrowserRuntime {
         fs::create_dir_all(&base).map_err(|error| {
             RuntimeError::Operation(format!("create gateway directory: {error}"))
         })?;
-        let values = SqliteResourceValueProvider::open(base.join("resources.sqlite"))
-            .map_err(|error| RuntimeError::Operation(format!("open resource cache: {error}")))?;
-        let fallback_marker = FallbackMarker::default();
-        let dns_trace = DnsTraceRecorder::default();
-        let resolver = android_gateway_resolver(
+        let persistent = self.persistent_gateway_resolver(
             base.clone(),
-            values,
             GatewayResolverContext {
                 network,
                 mode,
@@ -1913,9 +1986,12 @@ impl BrowserRuntime {
                 relay: Some(self.inner.coordination.relay.clone()),
                 http: self.inner.transport.clone(),
             },
-            fallback_marker.clone(),
-            dns_trace.clone(),
-        );
+        )?;
+        persistent.fallback_marker.reset();
+        persistent.dns_trace.reset();
+        let resolver = persistent.resolver.clone();
+        let fallback_marker = persistent.fallback_marker.clone();
+        let dns_trace = persistent.dns_trace.clone();
         let stateless_dane =
             stateless_dane_config(&base, parsed_headers.stateless_dane_certificates);
         let gateway = Gateway::new(
@@ -2854,24 +2930,25 @@ impl HnsProofProvider for GatewayProofProvider {
     }
 }
 
+#[derive(Clone)]
 struct AndroidGatewayResolver {
-    inner: Box<dyn Resolver>,
+    inner: Arc<dyn Resolver + Send + Sync>,
 }
 
 impl AndroidGatewayResolver {
-    fn new(inner: impl Resolver + 'static) -> Self {
+    fn new(inner: impl Resolver + Send + Sync + 'static) -> Self {
         Self {
-            inner: Box::new(inner),
+            inner: Arc::new(inner),
         }
     }
 }
 
 struct BoxedDelegatedResolver {
-    inner: Box<dyn DelegatedResolver>,
+    inner: Box<dyn DelegatedResolver + Send + Sync>,
 }
 
 impl BoxedDelegatedResolver {
-    fn new(inner: impl DelegatedResolver + 'static) -> Self {
+    fn new(inner: impl DelegatedResolver + Send + Sync + 'static) -> Self {
         Self {
             inner: Box::new(inner),
         }
@@ -2890,32 +2967,53 @@ impl DelegatedResolver for BoxedDelegatedResolver {
 
 #[derive(Clone, Debug, Default)]
 struct DnsTraceRecorder {
-    events: Arc<Mutex<Vec<DnsTraceEvent>>>,
-    relay: Arc<Mutex<Option<DnsRelayTraceMetadata>>>,
+    traces: Arc<Mutex<HashMap<thread::ThreadId, DnsTraceState>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct DnsTraceState {
+    events: Vec<DnsTraceEvent>,
+    relay: Option<DnsRelayTraceMetadata>,
 }
 
 impl DnsTraceRecorder {
     fn push(&self, event: DnsTraceEvent) {
-        if let Ok(mut events) = self.events.lock() {
-            events.push(event);
+        if let Ok(mut traces) = self.traces.lock() {
+            traces
+                .entry(thread::current().id())
+                .or_default()
+                .events
+                .push(event);
         }
     }
 
     fn snapshot(&self) -> Vec<DnsTraceEvent> {
-        self.events
+        self.traces
             .lock()
-            .map(|events| events.clone())
+            .ok()
+            .and_then(|traces| traces.get(&thread::current().id()).cloned())
+            .map(|trace| trace.events)
             .unwrap_or_default()
     }
 
     fn record_relay(&self, metadata: DnsRelayTraceMetadata) {
-        if let Ok(mut relay) = self.relay.lock() {
-            *relay = Some(metadata);
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.entry(thread::current().id()).or_default().relay = Some(metadata);
         }
     }
 
     fn relay_snapshot(&self) -> Option<DnsRelayTraceMetadata> {
-        self.relay.lock().ok().and_then(|relay| relay.clone())
+        self.traces.lock().ok().and_then(|traces| {
+            traces
+                .get(&thread::current().id())
+                .and_then(|trace| trace.relay.clone())
+        })
+    }
+
+    fn reset(&self) {
+        if let Ok(mut traces) = self.traces.lock() {
+            traces.remove(&thread::current().id());
+        }
     }
 }
 
@@ -3766,26 +3864,68 @@ impl Resolver for AndroidGatewayResolver {
 
 #[derive(Clone, Debug, Default)]
 struct FallbackMarker {
-    used: Arc<AtomicBool>,
-    reason: Arc<Mutex<Option<&'static str>>>,
+    states: Arc<Mutex<HashMap<thread::ThreadId, FallbackState>>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct FallbackState {
+    used: bool,
+    reason: Option<&'static str>,
+    roots: HashMap<String, &'static str>,
 }
 
 impl FallbackMarker {
     fn mark(&self, reason: &'static str) {
-        self.used.store(true, Ordering::Relaxed);
-        if let Ok(mut fallback_reason) = self.reason.lock()
-            && fallback_reason.is_none()
-        {
-            *fallback_reason = Some(reason);
+        if let Ok(mut states) = self.states.lock() {
+            let state = states.entry(thread::current().id()).or_default();
+            state.used = true;
+            if state.reason.is_none() {
+                state.reason = Some(reason);
+            }
         }
     }
 
     fn used(&self) -> bool {
-        self.used.load(Ordering::Relaxed)
+        self.states
+            .lock()
+            .ok()
+            .and_then(|states| states.get(&thread::current().id()).cloned())
+            .is_some_and(|state| state.used)
     }
 
     fn reason(&self) -> Option<&'static str> {
-        self.reason.lock().ok().and_then(|reason| *reason)
+        self.states.lock().ok().and_then(|states| {
+            states
+                .get(&thread::current().id())
+                .and_then(|state| state.reason)
+        })
+    }
+
+    fn reset(&self) {
+        if let Ok(mut states) = self.states.lock() {
+            states.remove(&thread::current().id());
+        }
+    }
+
+    fn cached_reason(&self, request: &ResolutionRequest) -> Option<&'static str> {
+        let root = fallback_cache_root(request);
+        self.states.lock().ok().and_then(|states| {
+            states
+                .get(&thread::current().id())
+                .and_then(|state| state.roots.get(&root).copied())
+        })
+    }
+
+    fn remember_reason(&self, request: &ResolutionRequest, reason: &'static str) {
+        let root = fallback_cache_root(request);
+        if let Ok(mut states) = self.states.lock() {
+            states
+                .entry(thread::current().id())
+                .or_default()
+                .roots
+                .entry(root)
+                .or_insert(reason);
+        }
     }
 }
 
@@ -3793,7 +3933,6 @@ struct FallbackResolver<P, F> {
     primary: P,
     fallback: F,
     fallback_marker: FallbackMarker,
-    fallback_roots: Arc<Mutex<HashMap<String, &'static str>>>,
 }
 
 impl<P, F> FallbackResolver<P, F> {
@@ -3802,23 +3941,15 @@ impl<P, F> FallbackResolver<P, F> {
             primary,
             fallback,
             fallback_marker,
-            fallback_roots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn cached_fallback_reason(&self, request: &ResolutionRequest) -> Option<&'static str> {
-        let root = fallback_cache_root(request);
-        self.fallback_roots
-            .lock()
-            .ok()
-            .and_then(|roots| roots.get(&root).copied())
+        self.fallback_marker.cached_reason(request)
     }
 
     fn remember_fallback_reason(&self, request: &ResolutionRequest, reason: &'static str) {
-        let root = fallback_cache_root(request);
-        if let Ok(mut roots) = self.fallback_roots.lock() {
-            roots.entry(root).or_insert(reason);
-        }
+        self.fallback_marker.remember_reason(request, reason);
     }
 }
 
@@ -3856,7 +3987,6 @@ struct FallbackDelegatedResolver<P, F> {
     primary: P,
     fallback: F,
     fallback_marker: FallbackMarker,
-    fallback_roots: Arc<Mutex<HashMap<String, &'static str>>>,
 }
 
 impl<P, F> FallbackDelegatedResolver<P, F> {
@@ -3865,23 +3995,15 @@ impl<P, F> FallbackDelegatedResolver<P, F> {
             primary,
             fallback,
             fallback_marker,
-            fallback_roots: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
     fn cached_fallback_reason(&self, request: &ResolutionRequest) -> Option<&'static str> {
-        let root = fallback_cache_root(request);
-        self.fallback_roots
-            .lock()
-            .ok()
-            .and_then(|roots| roots.get(&root).copied())
+        self.fallback_marker.cached_reason(request)
     }
 
     fn remember_fallback_reason(&self, request: &ResolutionRequest, reason: &'static str) {
-        let root = fallback_cache_root(request);
-        if let Ok(mut roots) = self.fallback_roots.lock() {
-            roots.entry(root).or_insert(reason);
-        }
+        self.fallback_marker.remember_reason(request, reason);
     }
 }
 
@@ -5237,13 +5359,28 @@ fn android_gateway_resolver(
 
     if use_legacy_doh {
         let hns = FallbackResolver::with_marker(
-            primary,
-            HnsDohResolver::new(doh_endpoint, dns_trace, http),
+            CachedResolver::new(
+                primary,
+                GATEWAY_RESOLVER_CACHE_ENTRIES,
+                GATEWAY_RESOLVER_CACHE_TTL,
+            ),
+            CachedResolver::new(
+                HnsDohResolver::new(doh_endpoint, dns_trace, http),
+                GATEWAY_RESOLVER_CACHE_ENTRIES,
+                GATEWAY_RESOLVER_CACHE_TTL,
+            ),
             fallback_marker,
         );
         AndroidGatewayResolver::new(CompositeResolver::new(hns, icann))
     } else {
-        AndroidGatewayResolver::new(CompositeResolver::new(primary, icann))
+        AndroidGatewayResolver::new(CompositeResolver::new(
+            CachedResolver::new(
+                primary,
+                GATEWAY_RESOLVER_CACHE_ENTRIES,
+                GATEWAY_RESOLVER_CACHE_TTL,
+            ),
+            icann,
+        ))
     }
 }
 
@@ -8369,6 +8506,73 @@ mod tests {
             "RuntimeProxyBackend(<redacted runtime>)"
         );
         cleanup_dir(&data_dir);
+    }
+
+    #[test]
+    fn browser_runtime_reuses_gateway_resolver_for_matching_policy() {
+        let data_dir = temp_dir_path("persistent-gateway-resolver");
+        let runtime =
+            BrowserRuntime::open(RuntimeConfiguration::new(&data_dir, NetworkKind::Regtest))
+                .unwrap();
+        let base = network_base_path(&runtime.inner.data_dir, NetworkKind::Regtest);
+        let context = |mode| GatewayResolverContext {
+            network: NetworkKind::Regtest,
+            mode,
+            doh_endpoint: HnsDohEndpoint::default(),
+            experimental_p2p_dns_relay: false,
+            legacy_hns_doh_compatibility: true,
+            peer_state: Some(Arc::clone(&runtime.inner.coordination.peer_state)),
+            relay: Some(runtime.inner.coordination.relay.clone()),
+            http: runtime.inner.transport.clone(),
+        };
+
+        let first = runtime
+            .persistent_gateway_resolver(
+                base.clone(),
+                context(GatewayResolutionMode::Compatibility),
+            )
+            .unwrap();
+        let second = runtime
+            .persistent_gateway_resolver(
+                base.clone(),
+                context(GatewayResolutionMode::Compatibility),
+            )
+            .unwrap();
+        let strict = runtime
+            .persistent_gateway_resolver(base.clone(), context(GatewayResolutionMode::Strict))
+            .unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+        assert!(!Arc::ptr_eq(&first, &strict));
+        assert_eq!(runtime.inner.gateway_resolvers.lock().unwrap().len(), 2);
+        cleanup_dir(&data_dir);
+    }
+
+    #[test]
+    fn persistent_resolver_diagnostics_are_thread_scoped() {
+        let marker = FallbackMarker::default();
+        let request = ResolutionRequest {
+            qname: "app.pirate".to_owned(),
+            qtype: RecordType::A.code(),
+        };
+        marker.mark("main-thread");
+        marker.remember_reason(&request, "main-thread");
+        let other = marker.clone();
+        thread::spawn(move || {
+            assert!(!other.used());
+            other.mark("worker-thread");
+            assert_eq!(other.reason(), Some("worker-thread"));
+            other.reset();
+            assert!(!other.used());
+        })
+        .join()
+        .unwrap();
+
+        assert!(marker.used());
+        assert_eq!(marker.reason(), Some("main-thread"));
+        assert_eq!(marker.cached_reason(&request), Some("main-thread"));
+        marker.reset();
+        assert_eq!(marker.cached_reason(&request), None);
     }
 
     fn trusted_proxy_metadata(headers: &[(&str, &str)]) -> InternalResponseMetadata {
