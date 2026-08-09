@@ -582,7 +582,7 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
+            applicationIdSuffix = ".combinedtest"
             versionNameSuffix = "-debug"
         }
         create("relayTest") {
