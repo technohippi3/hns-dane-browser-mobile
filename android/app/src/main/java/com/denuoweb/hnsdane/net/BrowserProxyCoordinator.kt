@@ -152,13 +152,15 @@ internal class BrowserProxyCoordinator(
         require((config == null) == (canonicalTargetHost == null)) {
             "HNS proxy configuration and target host must either both be present or both be absent"
         }
-        if (canonicalTargetHost != null && statusContext != null) {
-            activeBinding?.let { binding ->
-                activeBinding = null
-                unpublish(binding)
-                retire(binding.proxy)
+        if (canonicalTargetHost != null) {
+            statusContext?.let { context ->
+                // A superseding navigation invalidates only the old status mailbox entry. The
+                // proxy itself remains safe to reuse when its immutable scope and policy still
+                // cover the new target; rotating it here creates a route-block window after the
+                // caller has already stopped the current WebView load.
+                context.binding.proxy.discardMainFrameStatus(context.host)
+                statusContext = null
             }
-            statusContext = null
         }
         val effectiveConfig = updateDesiredConfig(config, retryFailedStart = true)
         if (effectiveConfig != null) {

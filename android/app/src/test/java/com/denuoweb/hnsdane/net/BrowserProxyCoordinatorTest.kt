@@ -359,23 +359,23 @@ class BrowserProxyCoordinatorTest {
     }
 
     @Test
-    fun overlappingSameScopeNavigationRotatesGenerationBeforeLoadingAgain() {
+    fun overlappingSameScopeNavigationDiscardsStatusBeforeLoadingAgain() {
         val fixture = Fixture()
-        val first = fixture.activate("alpha", completeNavigation = false)
-        val second = fixture.proxy("alpha", port = 43211)
-        fixture.factory.results += second
+        val proxy = fixture.activate("alpha", completeNavigation = false)
+        proxy.discardedHosts.clear()
 
         fixture.coordinator.navigate(fixture.config("alpha"), "alpha") {
             fixture.loads += "second"
         }
 
-        assertEquals(1, first.stopCalls)
-        assertEquals(1, fixture.overrideController.clearCalls)
-        fixture.overrideController.completeClear()
-        fixture.worker.runNext()
-        fixture.worker.runNext()
-        fixture.overrideController.completeApply(true)
+        assertEquals(listOf("alpha", "alpha"), proxy.discardedHosts)
         assertEquals(listOf("alpha", "second"), fixture.loads)
+        assertEquals(0, proxy.stopCalls)
+        assertEquals(0, proxy.joinCalls)
+        assertEquals(0, fixture.overrideController.clearCalls)
+        assertEquals(0, fixture.worker.size)
+        assertEquals(1, fixture.overrideController.applyCalls.size)
+        assertEquals(BrowserProxyRoute.Proxy, fixture.coordinator.routeForHnsHost("alpha"))
     }
 
     @Test
