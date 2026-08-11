@@ -582,8 +582,8 @@ android {
 
     buildTypes {
         debug {
-            applicationIdSuffix = ".debug"
-            versionNameSuffix = "-debug"
+            applicationIdSuffix = ".exactmain"
+            versionNameSuffix = "-exact-main"
         }
         create("relayTest") {
             initWith(getByName("debug"))
