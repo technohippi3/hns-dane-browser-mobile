@@ -26,6 +26,7 @@ import android.webkit.HttpAuthHandler
 import android.webkit.WebChromeClient
 import android.webkit.SslErrorHandler
 import android.webkit.URLUtil
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
@@ -34,6 +35,7 @@ import android.webkit.WebViewClient
 import android.net.http.SslError
 import android.widget.EditText
 import android.widget.FrameLayout
+import android.widget.ImageView
 import android.widget.LinearLayout
 import android.widget.PopupWindow
 import android.widget.ProgressBar
@@ -105,7 +107,9 @@ class MainActivity : ComponentActivity() {
     }
     private lateinit var webView: WebView
     private lateinit var omnibox: EditText
-    private lateinit var securityLabel: TextView
+    private lateinit var securityIndicator: ImageView
+    private lateinit var colors: ThemeColors
+    private var omniboxFullUrl: String = ""
     private lateinit var hamburgerButton: TextView
     private lateinit var syncProgressBar: ProgressBar
     private lateinit var syncProgressStats: TextView
@@ -142,10 +146,14 @@ class MainActivity : ComponentActivity() {
     private var pageLoadProgress: Int = 0
     private var navigationGeneration: Long = 0L
     private var pendingReadinessNavigation: PendingReadinessNavigation? = null
+    private var syncHeadersCurrent: Boolean = false
+    private var syncWaitMainFrameUrl: String? = null
+    private var syncWaitPageVisible: Boolean = false
+    private var automaticHnsRetryUsed: Boolean = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        val colors = themeColors()
+        colors = themeColors()
 
         WebView.setWebContentsDebuggingEnabled(BuildConfig.DEBUG)
         GatewayEventLog.configureAppStorage(filesDir)
@@ -157,7 +165,7 @@ class MainActivity : ComponentActivity() {
             runOnUiThread {
                 if (activityDestroyed) return@runOnUiThread
                 proxyAvailable = available
-                if (::securityLabel.isInitialized) refreshSecurityState()
+                if (::securityIndicator.isInitialized) refreshSecurityState()
             }
         }
         webViewGatewayInterceptor = HnsWebViewGatewayInterceptor(
@@ -215,23 +223,25 @@ class MainActivity : ComponentActivity() {
                 }
                 decision.consume
             }
+            setOnFocusChangeListener { _, hasFocus ->
+                if (hasFocus) {
+                    setText(omniboxFullUrl)
+                    post { selectAll() }
+                } else {
+                    setText(OmniboxDisplay.displayText(omniboxFullUrl))
+                }
+            }
         }
 
-        securityLabel = TextView(this).apply {
-            gravity = Gravity.CENTER
-            maxLines = 1
-            ellipsize = TextUtils.TruncateAt.END
-            textSize = 13f
-            minHeight = dp(TOOLBAR_CONTROL_HEIGHT_DP)
-            setPadding(dp(8), 0, dp(8), 0)
-            setTextColor(colors.securityText)
-            text = getString(R.string.security_syncing)
+        securityIndicator = ImageView(this).apply {
+            scaleType = ImageView.ScaleType.CENTER
             contentDescription = getString(R.string.security_status_content_description)
             isClickable = true
             isFocusable = true
             applyScreenSelectableBackground()
             setOnClickListener { openResolverTrace() }
         }
+        setSecurityState(SecurityState.Syncing)
 
         syncProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = SYNC_PROGRESS_MAX
@@ -250,13 +260,13 @@ class MainActivity : ComponentActivity() {
             setPadding(dp(32), dp(32), dp(32), dp(32))
             setTextColor(colors.primaryText)
             textSize = 16f
-            visibility = View.GONE
+            visibility = View.INVISIBLE
             isClickable = true
         }
         pageProgressBar = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = PAGE_PROGRESS_MAX
             progress = 0
-            visibility = View.GONE
+            visibility = View.INVISIBLE
         }
         httpWarningBar = TextView(this).apply {
             text = getString(R.string.http_transport_warning)
@@ -290,8 +300,8 @@ class MainActivity : ComponentActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             setPadding(dp(8), 0, dp(8), 0)
-            addView(securityLabel, LinearLayout.LayoutParams(
-                dp(SECURITY_LABEL_WIDTH_DP),
+            addView(securityIndicator, LinearLayout.LayoutParams(
+                dp(SECURITY_INDICATOR_WIDTH_DP),
                 dp(TOOLBAR_CONTROL_HEIGHT_DP),
             ))
             addView(omnibox, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f))
@@ -314,10 +324,6 @@ class MainActivity : ComponentActivity() {
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 LinearLayout.LayoutParams.WRAP_CONTENT,
             ))
-            addView(pageProgressBar, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT,
-                LinearLayout.LayoutParams.WRAP_CONTENT,
-            ))
             addView(httpWarningBar, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
                 dp(HTTP_WARNING_BAR_HEIGHT_DP),
@@ -330,6 +336,11 @@ class MainActivity : ComponentActivity() {
                 addView(syncGateNotice, FrameLayout.LayoutParams(
                     FrameLayout.LayoutParams.MATCH_PARENT,
                     FrameLayout.LayoutParams.MATCH_PARENT,
+                ))
+                addView(pageProgressBar, FrameLayout.LayoutParams(
+                    FrameLayout.LayoutParams.MATCH_PARENT,
+                    FrameLayout.LayoutParams.WRAP_CONTENT,
+                    Gravity.TOP,
                 ))
             }, LinearLayout.LayoutParams(
                 LinearLayout.LayoutParams.MATCH_PARENT,
@@ -390,9 +401,7 @@ class MainActivity : ComponentActivity() {
                 if (activityDestroyed) {
                     return@runOnUiThread
                 }
-                lastSyncSnapshot = snapshot
-                refreshSecurityState()
-                refreshSyncProgress()
+                applySyncSnapshot(snapshot)
             }
         }
         observeForegroundSync()
@@ -550,9 +559,7 @@ class MainActivity : ComponentActivity() {
                 if (!syncStatusPolling) {
                     return@runOnUiThread
                 }
-                lastSyncSnapshot = snapshot
-                refreshSecurityState()
-                refreshSyncProgress()
+                applySyncSnapshot(snapshot)
                 mainHandler.postDelayed(syncStatusPollRunnable, SYNC_STATUS_POLL_MS)
             }
         }
@@ -569,11 +576,29 @@ class MainActivity : ComponentActivity() {
                 if (syncSnapshotSubscription == null || activityDestroyed) {
                     return@post
                 }
-                lastSyncSnapshot = snapshot
-                refreshSecurityState()
-                refreshSyncProgress()
+                applySyncSnapshot(snapshot)
             }
         }
+    }
+
+    private fun applySyncSnapshot(snapshot: HnsSyncSnapshot) {
+        val wasCurrent = syncHeadersCurrent
+        lastSyncSnapshot = snapshot
+        syncHeadersCurrent = HnsSyncProgress.fromJson(snapshot.statusJson).isCurrent
+        refreshSecurityState()
+        refreshSyncProgress()
+        if (!wasCurrent && syncHeadersCurrent) {
+            retrySyncWaitPage()
+        }
+    }
+
+    private fun retrySyncWaitPage() {
+        if (!syncWaitPageVisible) return
+        val retryUrl = syncWaitMainFrameUrl ?: return
+        syncWaitPageVisible = false
+        syncWaitMainFrameUrl = null
+        val target = classifier.classify(retryUrl)
+        enqueueNavigation(target) { webView.loadUrl(target.url) }
     }
 
     private fun stopObservingForegroundSync() {
@@ -757,15 +782,31 @@ class MainActivity : ComponentActivity() {
         enqueueNavigation(classifier.classify(url)) { webView.goBackOrForward(offset) }
     }
 
-    private fun enqueueNavigation(target: BrowserTarget, load: () -> Unit) {
+    private fun showOmniboxUrl(url: String) {
+        omniboxFullUrl = url
+        if (!omnibox.hasFocus()) {
+            omnibox.setText(OmniboxDisplay.displayText(url))
+        }
+    }
+
+    private fun enqueueNavigation(
+        target: BrowserTarget,
+        preserveAutomaticRetryBudget: Boolean = false,
+        load: () -> Unit,
+    ) {
         navigationGeneration = navigationGeneration.wrappingIncrement()
         val generation = navigationGeneration
+        if (!preserveAutomaticRetryBudget) {
+            automaticHnsRetryUsed = false
+        }
         pendingReadinessNavigation = null
         if (::syncGateNotice.isInitialized) {
             syncGateNotice.visibility = View.GONE
         }
+        syncWaitPageVisible = false
+        syncWaitMainFrameUrl = null
         webView.stopLoading()
-        omnibox.setText(target.url)
+        showOmniboxUrl(target.url)
         currentTargetKind = target.kind
         clearMainFrameHnsStatus()
         if (target.kind == BrowserTargetKind.Blocked) {
@@ -857,12 +898,16 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun refreshSecurityState() {
+        if (syncWaitPageVisible) {
+            setSecurityState(SecurityState.ProofUnavailable)
+            return
+        }
         if (
             pageIsLoading &&
             currentTargetKind in NATIVE_GATEWAY_TARGET_KINDS &&
             mainFrameHnsStatusCode == null
         ) {
-            securityLabel.text = getString(R.string.security_loading)
+            setSecurityState(SecurityState.Loading)
             return
         }
 
@@ -951,7 +996,9 @@ class MainActivity : ComponentActivity() {
             pageProgressBar.progress = pageLoadProgress.coerceIn(0, PAGE_PROGRESS_MAX)
         } else {
             pageProgressBar.progress = PAGE_PROGRESS_MAX
-            pageProgressBar.visibility = View.GONE
+            // The bar overlays the WebView, so INVISIBLE preserves its own geometry
+            // without reserving a permanent row or shifting page content.
+            pageProgressBar.visibility = View.INVISIBLE
         }
     }
 
@@ -967,28 +1014,8 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun setSecurityState(state: SecurityState) {
-        val baseLabel = when (state) {
-            SecurityState.LocalContent -> getString(R.string.security_local_content)
-            SecurityState.Syncing -> getString(R.string.security_syncing)
-            SecurityState.Loading -> getString(R.string.security_loading)
-            SecurityState.HnsVerified -> getString(R.string.security_hns_verified)
-            SecurityState.HnsViaAuthoritativeDoh -> getString(R.string.security_hns_via_authoritative_doh)
-            SecurityState.HnsViaAuthoritativeDns53 -> getString(R.string.security_hns_via_authoritative_dns53)
-            SecurityState.HnsViaP2pDnsRelay -> getString(R.string.security_hns_via_p2p_dns_relay)
-            SecurityState.HnsViaUserConfiguredRecoveryDoh ->
-                getString(R.string.security_hns_via_user_configured_recovery_doh)
-            SecurityState.DaneVerified -> getString(R.string.security_dane_verified)
-            SecurityState.DaneViaAuthoritativeDoh -> getString(R.string.security_dane_via_authoritative_doh)
-            SecurityState.DaneViaAuthoritativeDns53 -> getString(R.string.security_dane_via_authoritative_dns53)
-            SecurityState.DaneViaP2pDnsRelay -> getString(R.string.security_dane_via_p2p_dns_relay)
-            SecurityState.DaneViaUserConfiguredRecoveryDoh ->
-                getString(R.string.security_dane_via_user_configured_recovery_doh)
-            SecurityState.StatelessDane -> getString(R.string.security_stateless_dane)
-            SecurityState.DaneViaIcannDoh -> getString(R.string.security_dane_via_icann_doh)
-            SecurityState.WebPkiOnly -> getString(R.string.security_webpki)
-            SecurityState.ValidationFailed -> getString(R.string.security_failed)
-            SecurityState.ProofUnavailable -> getString(R.string.security_proof_unavailable)
-        }
+        val presentation = SecurityIndicator.forState(state)
+        val baseLabel = getString(presentation.labelRes)
         val resolution = mainFrameHnsTraceJson
             ?.let { runCatching { JSONObject(it) }.getOrNull() }
             ?.optJSONObject("namespaceResolution")
@@ -1005,8 +1032,7 @@ class MainActivity : ComponentActivity() {
             "hnsOnly", "icannOnly" -> selectedLabel
             else -> null
         }
-        securityLabel.text = namespaceBadge?.let { "$baseLabel · $it" } ?: baseLabel
-        securityLabel.contentDescription = if (selectedLabel != null) {
+        val detailLabel = if (selectedLabel != null) {
             mainFrameHnsTraceJson
                 ?.let { LocalizedTraceText.namespace(this, runCatching { JSONObject(it) }.getOrNull()) }
                 ?.let { "$baseLabel. $it" }
@@ -1014,6 +1040,12 @@ class MainActivity : ComponentActivity() {
         } else {
             baseLabel
         }
+        securityIndicator.setImageResource(presentation.iconRes)
+        securityIndicator.setColorFilter(SecurityIndicator.toneColor(colors, presentation.tone))
+        securityIndicator.contentDescription = getString(
+            R.string.security_indicator_content_description,
+            namespaceBadge?.let { "$detailLabel. $it" } ?: detailLabel,
+        )
     }
 
     private inner class BrowserClient : WebViewClient() {
@@ -1042,7 +1074,7 @@ class MainActivity : ComponentActivity() {
             }
             pageIsLoading = true
             pageLoadProgress = pageLoadProgress.coerceAtLeast(5)
-            omnibox.setText(url)
+            showOmniboxUrl(url)
             admittedMainFrameUrl = url
             activeMainFrameUrl = url
             val target = classifier.classify(url)
@@ -1153,7 +1185,7 @@ class MainActivity : ComponentActivity() {
             if (pendingMainFrameUrl != null) return
             val admittedUrl = admittedMainFrameUrl ?: return
             if (admittedUrl.mainFrameMatchKey() != url.mainFrameMatchKey()) return
-            omnibox.setText(url)
+            showOmniboxUrl(url)
             activeMainFrameUrl = url
             admittedMainFrameUrl = url
             val target = classifier.classify(url)
@@ -1174,10 +1206,53 @@ class MainActivity : ComponentActivity() {
             }
             pageIsLoading = false
             pageLoadProgress = PAGE_PROGRESS_MAX
-            recordHistoryEntry(url, view.title)
+            if (!syncWaitPageVisible) {
+                recordHistoryEntry(url, view.title)
+            }
             refreshSecurityState()
             refreshPageProgress()
             refreshTransportWarning()
+        }
+
+        override fun onReceivedError(
+            view: WebView,
+            request: WebResourceRequest,
+            error: WebResourceError,
+        ) {
+            super.onReceivedError(view, request, error)
+            if (!request.isForMainFrame || pendingMainFrameUrl != null) return
+
+            val requestUrl = request.url.toString()
+            val admittedUrl = admittedMainFrameUrl ?: return
+            if (admittedUrl.mainFrameMatchKey() != requestUrl.mainFrameMatchKey()) return
+            if (classifier.classify(requestUrl).kind !in NATIVE_GATEWAY_TARGET_KINDS) return
+
+            showHnsLoadFailurePage(view, requestUrl)
+        }
+
+        override fun onReceivedHttpError(
+            view: WebView,
+            request: WebResourceRequest,
+            errorResponse: WebResourceResponse,
+        ) {
+            super.onReceivedHttpError(view, request, errorResponse)
+            if (!request.isForMainFrame || pendingMainFrameUrl != null) return
+            if (
+                !isRetryableHnsGatewayHttpFailure(
+                    errorResponse.statusCode,
+                    errorResponse.reasonPhrase,
+                )
+            ) {
+                return
+            }
+
+            val requestUrl = request.url.toString()
+            val admittedUrl = admittedMainFrameUrl ?: return
+            if (admittedUrl.mainFrameMatchKey() != requestUrl.mainFrameMatchKey()) return
+            if (classifier.classify(requestUrl).kind !in NATIVE_GATEWAY_TARGET_KINDS) return
+
+            showHnsLoadFailurePage(view, requestUrl)
+            scheduleAutomaticHnsRetry(requestUrl)
         }
 
         override fun onRenderProcessGone(view: WebView, detail: RenderProcessGoneDetail): Boolean {
@@ -1199,10 +1274,10 @@ class MainActivity : ComponentActivity() {
 
     private inner class BrowserChromeClient : WebChromeClient() {
         override fun onProgressChanged(view: WebView, newProgress: Int) {
+            // WebView re-reports progress below 100 for lazy-loaded subresources long after
+            // the main-frame load finished; only main-frame navigation state may show the bar.
+            if (!pageIsLoading) return
             pageLoadProgress = newProgress.coerceIn(0, PAGE_PROGRESS_MAX)
-            if (pageLoadProgress < PAGE_PROGRESS_MAX) {
-                pageIsLoading = true
-            }
             refreshPageProgress()
         }
     }
@@ -1210,9 +1285,61 @@ class MainActivity : ComponentActivity() {
     private fun openResolverTrace() {
         startActivity(
             Intent(this, HnsResolverTraceActivity::class.java)
-                .putExtra(HnsResolverTraceActivity.EXTRA_URL, omnibox.text.toString())
+                .putExtra(HnsResolverTraceActivity.EXTRA_URL, omniboxFullUrl)
                 .putExtra(HnsResolverTraceActivity.EXTRA_TRACE_JSON, mainFrameHnsTraceJson),
         )
+    }
+
+    private fun showHnsLoadFailurePage(view: WebView, failedUrl: String) {
+        if (syncWaitPageVisible && syncWaitMainFrameUrl?.mainFrameMatchKey() == failedUrl.mainFrameMatchKey()) {
+            return
+        }
+        syncWaitMainFrameUrl = failedUrl
+        syncWaitPageVisible = true
+        pageIsLoading = false
+        pageLoadProgress = PAGE_PROGRESS_MAX
+        clearMainFrameHnsStatus()
+        showOmniboxUrl(failedUrl)
+        refreshSecurityState()
+        refreshPageProgress()
+        val detail = if (syncHeadersCurrent) {
+            getString(R.string.hns_load_failed_body)
+        } else {
+            getString(R.string.hns_sync_wait_body)
+        }
+        view.loadDataWithBaseURL(
+            failedUrl,
+            HnsLoadFailurePage.render(
+                title = getString(R.string.hns_load_failed_title),
+                detail = detail,
+                displayHost = OmniboxDisplay.displayText(failedUrl),
+                retryLabel = getString(R.string.hns_retry),
+                retryUrl = failedUrl,
+            ),
+            "text/html",
+            "utf-8",
+            failedUrl,
+        )
+    }
+
+    private fun scheduleAutomaticHnsRetry(failedUrl: String) {
+        if (automaticHnsRetryUsed) return
+        automaticHnsRetryUsed = true
+        val failedGeneration = navigationGeneration
+        mainHandler.postDelayed({
+            if (
+                activityDestroyed ||
+                failedGeneration != navigationGeneration ||
+                !syncWaitPageVisible ||
+                syncWaitMainFrameUrl?.mainFrameMatchKey() != failedUrl.mainFrameMatchKey()
+            ) {
+                return@postDelayed
+            }
+            val target = classifier.classify(failedUrl)
+            enqueueNavigation(target, preserveAutomaticRetryBudget = true) {
+                webView.loadUrl(target.url)
+            }
+        }, AUTOMATIC_HNS_RETRY_DELAY_MS)
     }
 
     private fun openSettings() {
@@ -1445,7 +1572,7 @@ class MainActivity : ComponentActivity() {
         webView.url
             ?.trim()
             ?.takeIf { it.isNotBlank() && it != "about:blank" }
-            ?: omnibox.text.toString()
+            ?: omniboxFullUrl
                 .trim()
                 .takeIf { it.isNotBlank() && it != "about:blank" }
 
@@ -1500,7 +1627,8 @@ class MainActivity : ComponentActivity() {
         private const val SYNC_PROGRESS_MAX = 1000
         private const val PAGE_PROGRESS_MAX = 100
         private const val SYNC_STATUS_POLL_MS = 2_000L
-        private const val SECURITY_LABEL_WIDTH_DP = 136
+        private const val AUTOMATIC_HNS_RETRY_DELAY_MS = 1_500L
+        private const val SECURITY_INDICATOR_WIDTH_DP = 44
         private const val TOOLBAR_CONTROL_HEIGHT_DP = 48
         private const val HTTP_WARNING_BAR_HEIGHT_DP = 22
         private const val MENU_ICON_BUTTON_SIZE_DP = 55
@@ -1528,6 +1656,16 @@ private data class PendingReadinessNavigation(
 )
 
 private fun Long.wrappingIncrement(): Long = if (this == Long.MAX_VALUE) 1L else this + 1L
+
+private val RETRYABLE_HNS_GATEWAY_REASONS = setOf(
+    "HNS Resolution Unavailable",
+    "HNS Proof Unavailable",
+    "Namespace Resolution Indeterminate",
+    "HNS Sync Incomplete",
+)
+
+internal fun isRetryableHnsGatewayHttpFailure(statusCode: Int, reasonPhrase: String?): Boolean =
+    statusCode == 503 && reasonPhrase?.trim().orEmpty() in RETRYABLE_HNS_GATEWAY_REASONS
 
 private val EXTERNAL_VIEW_SCHEMES = setOf("mailto", "tel", "sms", "geo")
 
