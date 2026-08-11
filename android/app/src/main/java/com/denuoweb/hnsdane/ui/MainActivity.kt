@@ -1307,10 +1307,15 @@ class MainActivity : ComponentActivity() {
         } else {
             getString(R.string.hns_sync_wait_body)
         }
+        val failureTitle = if (classifier.classify(failedUrl).kind == BrowserTargetKind.HnsName) {
+            getString(R.string.hns_load_failed_title)
+        } else {
+            getString(R.string.page_load_failed_title)
+        }
         view.loadDataWithBaseURL(
             failedUrl,
             HnsLoadFailurePage.render(
-                title = getString(R.string.hns_load_failed_title),
+                title = failureTitle,
                 detail = detail,
                 displayHost = OmniboxDisplay.displayText(failedUrl),
                 retryLabel = getString(R.string.hns_retry),
